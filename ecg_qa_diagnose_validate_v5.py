@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional, Tuple, Set
 import random
+from unicodedata import category
 import uuid
 import json
 import itertools
@@ -15,9 +16,29 @@ import collections
 # Config
 # --------------------------
 
-DIAGNOSE_VALIDATE_ENTITY_PRESENCE = False
-DIAGNOSE_VALIDATE_ATTRIBUTES = False
+DIAGNOSE_VALIDATE_ENTITY_PRESENCE = True
+DIAGNOSE_VALIDATE_ATTRIBUTES = True
 REASONING_QUESTIONS_ENABLED = True
+
+# Dynamic Scope Generation Config
+DYNAMIC_SCOPE_GENERATION = {
+    "enabled": True,  # Master switch for dynamic scope generation
+    
+    # For each question type, which scope variations to generate
+    # a = category, b = subcategory, c = category/subcategory + attributes, d = concept + attributes
+    "presence": {
+        "subcategory_scoped": ["a", "b", "c", "d"],  # When original scope is subcategory
+        "category_scoped": ["a", "c", "d"],  # When original scope is category (no b)
+    },
+    "evidence_attribution": {
+        "subcategory_scoped": ["a", "b", "c", "d"],
+        "category_scoped": ["a", "c", "d"],
+    },
+    "inference": {
+        "subcategory_scoped": ["a", "b", "c", "d"],
+        "category_scoped": ["a", "c", "d"],
+    },
+}
 
 SCHEMA_CONFIG = {
     # Categories to include in presence questions
@@ -285,13 +306,21 @@ class EntityItem:
 class QAPool:
     # concept_pool: Dict[Tuple[str, Optional[str]], Set[str]] = field(default_factory=lambda: collections.defaultdict(set))
     # category_pool: Dict[str, Set[str]] = field(default_factory=lambda: collections.defaultdict(set))
-    attribute_pool: Dict[str, Set[Any]] = field(default_factory=lambda: collections.defaultdict(set))
     
+    # Schema-based concept pools
     schema_concept_pool: Dict[Tuple[str, Optional[str]], Set[str]] = field(default_factory=lambda: collections.defaultdict(set))  # (category, subcategory) -> concepts
     schema_category_pool: Dict[str, Set[str]] = field(default_factory=lambda: collections.defaultdict(set))  # category -> concepts
+
+    # Attribute pools
+    attribute_pool: Dict[str, Set[Any]] = field(default_factory=lambda: collections.defaultdict(set))
     schema_attribute_pool: Dict[str, Set[Any]] = field(default_factory=lambda: collections.defaultdict(set))  # attribute name -> values
 
-    schema_subcategory_list: Set[str] = field(default_factory=set)  # Set of all subcategories in schema
+    # Track which attributes are used with which concepts
+    concept_attribute_pool: Dict[Tuple[str, str], Set[Any]] = field(default_factory=lambda: collections.defaultdict(set))  # (concept, attr_name) -> values
+    schema_concept_attribute_pool: Dict[Tuple[str, str], Set[Any]] = field(default_factory=lambda: collections.defaultdict(set))  # (concept, attr_name) -> values
+    
+    # Set of all subcategories in schema
+    schema_subcategory_list: Set[str] = field(default_factory=set)  
 
     def add_attributes_from_entity(self, ent: EntityItem):
         # key = (ent.category, ent.subcategory)
@@ -304,8 +333,12 @@ class QAPool:
             if isinstance(v, (list, tuple, set)):
                 for x in v:
                     self.attribute_pool[k].add(x)
+                    # Track concept-specific attributes
+                    self.concept_attribute_pool[(ent.concept, k)].add(x)
             else:
                 self.attribute_pool[k].add(v)
+                # Track concept-specific attributes
+                self.concept_attribute_pool[(ent.concept, k)].add(v)
 
     def load_schema(self, schema_path: str):
         """Load schema to build comprehensive distractor pools"""
@@ -331,15 +364,21 @@ class QAPool:
                 attr_hints = subcat_data.get("attribute_hints_add", {})  # Attribute hints at subcategory level
                 for attr_name, values in attr_hints.items():  # Add attribute hints to attribute pool
                     self.schema_attribute_pool[attr_name].update(values)
+                    
+                    for concept in concepts:  # Track concept-specific attribute hints
+                        self.schema_concept_attribute_pool[(concept, attr_name)].update(values)
                 
                 for group in subcat_data.get("groups", []):  # Process groups within subcategory
-                    # group_concepts = group.get("concepts", [])  # Concepts in this group
+                    group_concepts = group.get("concepts", [])  # Concepts in this group
                     # self.schema_concept_pool[key].update(group_concepts)
                     # self.schema_category_pool[category].update(group_concepts)
                     
                     group_hints = group.get("attribute_hints_add", {})  # Attribute hints at group level
                     for attr_name, values in group_hints.items():  # Add group attribute hints to attribute pool
                         self.schema_attribute_pool[attr_name].update(values)
+                        
+                        for concept in group_concepts:  # Track concept-specific attribute hints
+                            self.schema_concept_attribute_pool[(concept, attr_name)].update(values)
 
         defaults = schema.get("defaults", {})
         default_hints = defaults.get("attribute_hints", {})
@@ -360,6 +399,12 @@ class QAPool:
         """Get combined attribute pool (corpus + schema)"""
         corpus_pool = self.attribute_pool.get(attribute, set())
         schema_pool = self.schema_attribute_pool.get(attribute, set())
+        return corpus_pool | schema_pool
+    
+    def get_concept_attribute_pool(self, concept: str, attribute: str) -> Set[Any]:
+        """Get combined attribute pool specific to a concept (corpus + schema)"""
+        corpus_pool = self.concept_attribute_pool.get((concept, attribute), set())
+        schema_pool = self.schema_concept_attribute_pool.get((concept, attribute), set())
         return corpus_pool | schema_pool
 
 
@@ -436,6 +481,44 @@ class DiagnoseValidateQAGenerator:
             return True
         
         return False
+    
+    def _format_entity_with_attributes(self, concept: str, attributes: Dict[str, Any], 
+                                      attr_fields: List[str]) -> List[str]:
+        """Format entity with attributes for scope c/d questions"""
+        variations = []
+        
+        # Base concept
+        variations.append(concept)
+        
+        # Add attribute variations
+        for attr in attr_fields:
+            if attr not in attributes:
+                continue
+            
+            val = attributes.get(attr)
+            if val is None:
+                continue
+                
+            # Handle multi-valued attributes
+            values = val if isinstance(val, (list, tuple, set)) else [val]
+            
+            for v in values:
+                pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                formatted = f"{concept} with {pretty_attr} of {v}"
+                variations.append(formatted)
+        
+        return variations
+    
+    def _get_concept_specific_attributes(self, concept: str, attr_name: str, 
+                                      category: str, subcategory: Optional[str]) -> Set[Any]:
+        """Get attribute values that are actually used with this concept in the schema"""
+        # This is a simple heuristic - you might want to enhance this based on your schema structure
+        # For now, just return schema attributes, but you could filter based on concept-attribute pairs
+        # from your schema if you have that information
+        
+        # TODO: Ideally, track concept->attribute mappings when loading schema
+        # For now, return schema attributes as a baseline
+        return self._pool.schema_attribute_pool.get(attr_name, set())
 
     ### Public API methods
     # Build reports-based attribute pool from list of reports
@@ -462,19 +545,30 @@ class DiagnoseValidateQAGenerator:
         for e in entities:
             by_cat[(e.category, e.subcategory)].append(e)
 
-        # 1-1: Diagnose/Validate entity presence
-        if DIAGNOSE_VALIDATE_ENTITY_PRESENCE:
+        # 1-1: Diagnose/Validate entity presence - DYNAMIC SCOPE GENERATION
+        if DIAGNOSE_VALIDATE_ENTITY_PRESENCE and DYNAMIC_SCOPE_GENERATION["enabled"]:
             for (cat, subcat), ents in by_cat.items():
-                if not self._is_presence_allowed(cat):  # Skip categories not in whitelist
+                if not self._is_presence_allowed(cat):
                     continue
 
-                use_cat_scope = any(self._should_use_category_scope(e.concept, subcat) for e in ents)  # Determine if category scope should be used
-            
-                pool = self._pool.get_concept_pool(cat, subcat, use_category_scope=use_cat_scope)  # Get distractor pool
-                if len(pool) < self.cfg["min_pool_sizes"]["presence"]:  # Skip if pool too small
-                    continue
+                use_cat_scope = any(self._should_use_category_scope(e.concept, subcat) for e in ents)
+                
+                # Determine which scopes to generate
+                if use_cat_scope:
+                    scopes_to_gen = DYNAMIC_SCOPE_GENERATION["presence"]["category_scoped"]
+                else:
+                    scopes_to_gen = DYNAMIC_SCOPE_GENERATION["presence"]["subcategory_scoped"]
+                
+                # Generate for each scope
+                for scope_type in scopes_to_gen:
+                    pool = self._pool.get_concept_pool(cat, subcat, use_category_scope=(scope_type == "a"))
+                    
+                    if len(pool) < self.cfg["min_pool_sizes"]["presence"]:
+                        continue
 
-                qa_items.append(self._make_presence_item(report, cat, subcat, ents, use_cat_scope))
+                    item = self._make_presence_item(report, cat, subcat, ents, scope_type)
+                    if item:
+                        qa_items.append(item)
 
         # 1-2: Diagnose/Validate attributes for entities
         if DIAGNOSE_VALIDATE_ATTRIBUTES:
@@ -504,25 +598,43 @@ class DiagnoseValidateQAGenerator:
                     if tail_id in ent_by_id and head_id in ent_by_id:
                         by_impression[tail_id].append(head_id)
                 
-                # 3-1: Evidence Attribution (Which findings justify this impression?)
+                # 3-1: Evidence Attribution (Which findings justify this impression?) - DYNAMIC SCOPE
                 for impression_id, finding_ids in by_impression.items():
                     if len(finding_ids) > 0:
-                        item = self._make_evidence_attribution_item(
-                            report, ent_by_id[impression_id], 
-                            [ent_by_id[fid] for fid in finding_ids], entities
-                        )
-                        if item:
-                            qa_items.append(item)
+                        impression_ent = ent_by_id[impression_id]
+                        use_cat_scope = self._should_use_category_scope(impression_ent.concept, impression_ent.subcategory)
+                        
+                        if use_cat_scope:
+                            scopes = DYNAMIC_SCOPE_GENERATION["evidence_attribution"]["category_scoped"]
+                        else:
+                            scopes = DYNAMIC_SCOPE_GENERATION["evidence_attribution"]["subcategory_scoped"]
+                        
+                        for scope_type in scopes:
+                            item = self._make_evidence_attribution_item(
+                                report, impression_ent,
+                                [ent_by_id[fid] for fid in finding_ids], entities, scope_type
+                            )
+                            if item:
+                                qa_items.append(item)
                 
-                # 3-2: Inference (Which diagnosis is implied by these findings?)
+                # 3-2: Inference (Which diagnosis is implied by these findings?) - DYNAMIC SCOPE
                 for impression_id, finding_ids in by_impression.items():
                     if len(finding_ids) > 0:
-                        item = self._make_inference_item(
-                            report, ent_by_id[impression_id],
-                            [ent_by_id[fid] for fid in finding_ids], entities
-                        )
-                        if item:
-                            qa_items.append(item)
+                        impression_ent = ent_by_id[impression_id]
+                        use_cat_scope = self._should_use_category_scope(impression_ent.concept, impression_ent.subcategory)
+                        
+                        if use_cat_scope:
+                            scopes = DYNAMIC_SCOPE_GENERATION["inference"]["category_scoped"]
+                        else:
+                            scopes = DYNAMIC_SCOPE_GENERATION["inference"]["subcategory_scoped"]
+                        
+                        for scope_type in scopes:
+                            item = self._make_inference_item(
+                                report, impression_ent,
+                                [ent_by_id[fid] for fid in finding_ids], entities, scope_type
+                            )
+                            if item:
+                                qa_items.append(item)
         
                 # 3-3 Counterfactual reasoning
         
@@ -534,61 +646,294 @@ class DiagnoseValidateQAGenerator:
         return qa_items
 
     def _make_presence_item(self, report, category, subcategory, ents_in_report: List[EntityItem], 
-                           use_category_scope: bool) -> Dict[str, Any]:
-        concepts_present = sorted({e.concept for e in ents_in_report})  # Category-subcategory concepts in report
-        pool = sorted(self._pool.get_concept_pool(category, subcategory, use_category_scope=use_category_scope))  # Distractor pool
-
-        min_c, max_c = self.cfg["multilabel_caps"]["presence"]
-        k_correct = min(max(len(concepts_present), 1), max_c)
-        correct = sorted(random.sample(concepts_present, k=k_correct)) if len(concepts_present) > k_correct else concepts_present
-
-        # Filter distractors using rollup hierarchy
-        distractors = []
-        correct_related = set()
-        for c in correct:  # Gather all related concepts via rollups
-            correct_related.update(self._get_rollup_related(c))
-            correct_related.add(self._normalize_concept(c))
+                        scope_type: str) -> Optional[Dict[str, Any]]:
+        """
+        Generate presence question with dynamic scope:
+        a = category scope (concepts only)
+        b = subcategory scope (concepts only)
+        c = category/subcategory scope with attributes
+        d = concept scope with attributes
+        """
         
-        for candidate in pool:  # Filter distractors by correct answers and their related concepts (parents/children/grandchildren)
-            if candidate in concepts_present:
-                continue
-            if self._normalize_concept(candidate) in correct_related:
-                continue
-            distractors.append(candidate)
-        
-        random.shuffle(distractors)
+        # Scope a: category-level concepts only
+        if scope_type == "a":
+            concepts_present = sorted({e.concept for e in ents_in_report})
+            pool = sorted(self._pool.get_concept_pool(category, subcategory, use_category_scope=True))
+            
+            if len(pool) < self.cfg["min_pool_sizes"]["presence"]:
+                return None
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["presence"]
+            k_correct = min(max(len(concepts_present), 1), max_c)
+            correct = sorted(random.sample(concepts_present, k=k_correct)) if len(concepts_present) > k_correct else concepts_present
 
-        num_opts = self.cfg["num_options"]["presence_multi"] if len(correct) > 1 else self.cfg["num_options"]["presence_single"]
-        needed = max(0, num_opts - len(correct))
-        options = correct + distractors[:needed]
-        random.shuffle(options)
+            # Filter distractors using rollup hierarchy
+            distractors = []
+            correct_related = set()
+            for c in correct:
+                correct_related.update(self._get_rollup_related(c))
+                correct_related.add(self._normalize_concept(c))
+            
+            for candidate in pool:
+                if candidate in concepts_present:
+                    continue
+                if self._normalize_concept(candidate) in correct_related:
+                    continue
+                distractors.append(candidate)
+            
+            random.shuffle(distractors)
 
-        multi_label = len(correct) > 1
-        
-        # Build question
-        if use_category_scope:
+            num_opts = self.cfg["num_options"]["presence_multi"] if len(correct) > 1 else self.cfg["num_options"]["presence_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+
+            multi_label = len(correct) > 1
             entity_type = self.cfg["category_pretty"].get(category, category)
-        else:
-            entity_type = self.cfg["subcategory_pretty"].get(subcategory, subcategory)
-        
-        question = f"Which {entity_type} are present in this ECG?" if multi_label else f"Which {entity_type} is present in this ECG?"
+            question = f"Which {entity_type} are present in this ECG?" if multi_label else f"Which {entity_type} is present in this ECG?"
 
-        return {
-            "qa_id": str(uuid.uuid4()),
-            "report_id": report.get("report_id"),
-            "family": "DiagnoseValidate",
-            "question_type": "presence_multi" if multi_label else "presence_single",
-            "difficulty": "D0",
-            "question": question,
-            "options": options,
-            "answer": correct if multi_label else correct[0],
-            "meta": {
-                "scope_category": category,
-                "scope_subcategory": subcategory,
-                "scope_level": "category" if use_category_scope else "subcategory",
-                "attribute_role": None,
-            },
-        }
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "presence_multi" if multi_label else "presence_single",
+                "difficulty": "D0",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "scope_category": category,
+                    "scope_subcategory": subcategory,
+                    "scope_level": "category",
+                    "scope_type": "a",
+                    "attribute_role": None,
+                },
+            }
+        
+        # Scope b: subcategory-level concepts only
+        elif scope_type == "b":
+            concepts_present = sorted({e.concept for e in ents_in_report})
+            pool = sorted(self._pool.get_concept_pool(category, subcategory, use_category_scope=False))
+            
+            if len(pool) < self.cfg["min_pool_sizes"]["presence"]:
+                return None
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["presence"]
+            k_correct = min(max(len(concepts_present), 1), max_c)
+            correct = sorted(random.sample(concepts_present, k=k_correct)) if len(concepts_present) > k_correct else concepts_present
+
+            # Filter distractors using rollup hierarchy
+            distractors = []
+            correct_related = set()
+            for c in correct:
+                correct_related.update(self._get_rollup_related(c))
+                correct_related.add(self._normalize_concept(c))
+            
+            for candidate in pool:
+                if candidate in concepts_present:
+                    continue
+                if self._normalize_concept(candidate) in correct_related:
+                    continue
+                distractors.append(candidate)
+            
+            random.shuffle(distractors)
+
+            num_opts = self.cfg["num_options"]["presence_multi"] if len(correct) > 1 else self.cfg["num_options"]["presence_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+
+            multi_label = len(correct) > 1
+            entity_type = self.cfg["subcategory_pretty"].get(subcategory, subcategory)
+            question = f"Which {entity_type} are present in this ECG?" if multi_label else f"Which {entity_type} is present in this ECG?"
+
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "presence_multi" if multi_label else "presence_single",
+                "difficulty": "D0",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "scope_category": category,
+                    "scope_subcategory": subcategory,
+                    "scope_level": "subcategory",
+                    "scope_type": "b",
+                    "attribute_role": None,
+                },
+            }
+        
+        # Scope c: category/subcategory with attributes
+        elif scope_type == "c":
+            # Determine if using category or subcategory scope
+            use_cat_scope = any(self._should_use_category_scope(e.concept, subcategory) for e in ents_in_report)
+            
+            # Build correct answers: entity + attributes
+            correct = []
+            for ent in ents_in_report:
+                # Get relevant attribute fields (perceptual only for presence questions)
+                attr_fields = self.cfg["attribute_fields"]["perceptual"]
+                variations = self._format_entity_with_attributes(ent.concept, ent.attributes, attr_fields)
+                correct.extend(variations)
+            
+            correct = sorted(set(correct))
+            
+            # Build distractors: concepts from pool + their possible attributes
+            pool_concepts = sorted(self._pool.get_concept_pool(category, subcategory, use_category_scope=use_cat_scope))
+            attr_pool = self.cfg["attribute_fields"]["perceptual"]
+            
+            distractors = []
+            concepts_present = {e.concept for e in ents_in_report}
+            
+            # Filter rollup-related concepts
+            correct_related = set()
+            for ent in ents_in_report:
+                correct_related.update(self._get_rollup_related(ent.concept))
+                correct_related.add(self._normalize_concept(ent.concept))
+            
+            for concept in pool_concepts:
+                if concept in concepts_present:
+                    continue
+                if self._normalize_concept(concept) in correct_related:
+                    continue
+                
+                # Add base concept
+                distractors.append(concept)
+                
+                # Add concept with attributes specific to this concept
+                for attr in attr_fields:
+                    concept_attr_values = self._pool.get_concept_attribute_pool(concept, attr)
+                    for val in list(concept_attr_values)[:3]:  # Limit to 3 values per attribute
+                        pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                        formatted = f"{concept} with {pretty_attr} of {val}"
+                        distractors.append(formatted)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["presence"]:
+                return None
+            
+            random.shuffle(distractors)
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["presence"]
+            k_correct = min(max(len(correct), 1), max_c)
+            correct = sorted(random.sample(correct, k=k_correct)) if len(correct) > k_correct else correct
+
+            num_opts = self.cfg["num_options"]["presence_multi"] if len(correct) > 1 else self.cfg["num_options"]["presence_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+
+            multi_label = len(correct) > 1
+            
+            if use_cat_scope:
+                entity_type = self.cfg["category_pretty"].get(category, category)
+            else:
+                entity_type = self.cfg["subcategory_pretty"].get(subcategory, subcategory)
+            
+            question = f"Which {entity_type} are present in this ECG?" if multi_label else f"Which {entity_type} is present in this ECG?"
+
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "presence_multi" if multi_label else "presence_single",
+                "difficulty": "D0",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "scope_category": category,
+                    "scope_subcategory": subcategory,
+                    "scope_level": "category_with_attributes" if use_cat_scope else "subcategory_with_attributes",
+                    "scope_type": "c",
+                    "attribute_role": "perceptual",
+                },
+            }
+        
+        # Scope d: concept with attributes
+        elif scope_type == "d":
+            # Group entities by concept
+            by_concept = collections.defaultdict(list)
+            for ent in ents_in_report:
+                by_concept[ent.concept].append(ent)
+            
+            # Generate question for each concept (pick one randomly if multiple)
+            concept = random.choice(list(by_concept.keys()))
+            ents_for_concept = by_concept[concept]
+            
+            # Build correct answers: attributes for this concept
+            correct = []
+            attr_fields = self.cfg["attribute_fields"]["perceptual"]
+            
+            for ent in ents_for_concept:
+                variations = self._format_entity_with_attributes(ent.concept, ent.attributes, attr_fields)
+                correct.extend(variations)
+            
+            correct = sorted(set(correct))
+            
+            # Build distractors: same concept with different attributes
+            distractors = []
+            
+            for attr in attr_fields:
+                concept_attr_values = self._pool.get_concept_attribute_pool(concept, attr)
+                
+                # Get existing values for this concept in this report
+                existing_vals = set()
+                for ent in ents_for_concept:
+                    val = ent.attributes.get(attr)
+                    if val:
+                        if isinstance(val, (list, tuple, set)):
+                            existing_vals.update(val)
+                        else:
+                            existing_vals.add(val)
+                
+                # Add distractors with different attribute values specific to this concept
+                for val in concept_attr_values:
+                    if val in existing_vals:
+                        continue
+                    pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                    formatted = f"{concept} with {pretty_attr} of {val}"
+                    distractors.append(formatted)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["presence"]:
+                return None
+            
+            random.shuffle(distractors)
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["presence"]
+            k_correct = min(max(len(correct), 1), max_c)
+            correct = sorted(random.sample(correct, k=k_correct)) if len(correct) > k_correct else correct
+
+            num_opts = self.cfg["num_options"]["presence_multi"] if len(correct) > 1 else self.cfg["num_options"]["presence_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+
+            multi_label = len(correct) > 1
+            
+            question = f"Which attributes apply to {concept} in this ECG?" if multi_label else f"Which attribute applies to {concept} in this ECG?"
+
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "presence_multi" if multi_label else "presence_single",
+                "difficulty": "D0",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "scope_category": category,
+                    "scope_subcategory": subcategory,
+                    "scope_level": "concept_with_attributes",
+                    "scope_type": "d",
+                    "target_concept": concept,
+                    "attribute_role": "perceptual",
+                },
+            }
+        
+        return None
 
     def _is_presence_allowed(self, category: str) -> bool:
         return category in self.cfg["presence_whitelist"]
@@ -658,183 +1003,532 @@ class DiagnoseValidateQAGenerator:
     #     return f"{ent.concept} ({cat}{sub})"
 
     def _make_evidence_attribution_item(self, report: Dict[str, Any], impression: EntityItem,
-                                               findings: List[EntityItem], all_entities: List[EntityItem]) -> Optional[Dict[str, Any]]:
+                                            findings: List[EntityItem], all_entities: List[EntityItem],
+                                            scope_type: str) -> Optional[Dict[str, Any]]:
         """
         Create a question asking which findings justify/support an impression or diagnosis.
-        Template: "Which findings suggest {impression}?"
-        Distractors: findings from same subcategory/category, or other findings
+        scope_type: a, b, c, or d
         """
         if not findings:
             return None
         
-        # Get correct findings (concepts)
-        correct_findings = sorted({f.concept for f in findings})
-        
-        # Build distractor pool
-        distractors = []
-        
-        # Strategy 1: Findings from same subcategory/category as the correct findings
-        for f in findings:
-            # Same subcategory
-            same_subcat = [e.concept for e in all_entities 
-                          if e.category == f.category and e.subcategory == f.subcategory 
-                          and e.concept not in correct_findings]
-            distractors.extend(same_subcat)
+        # Scope a: category-level findings
+        if scope_type == "a":
+            correct_findings = sorted({f.concept for f in findings})
             
-            # Same category
-            same_cat = [e.concept for e in all_entities
-                       if e.category == f.category and e.subcategory != f.subcategory
-                       and e.concept not in correct_findings]
-            distractors.extend(same_cat)
-        
-        # Strategy 2: Add other Primary_findings not related to this impression
-        other_findings = [e.concept for e in all_entities
-                         if e.category == "Primary_findings" and e.concept not in correct_findings]
-        distractors.extend(other_findings)
-        
-        # Strategy 3: Add Axis_and_voltage findings as distractors
-        axis_findings = [e.concept for e in all_entities
-                        if e.category == "Axis_and_voltage" and e.concept not in correct_findings]
-        distractors.extend(axis_findings)
-        
-        # Deduplicate and shuffle
-        distractors = sorted(set(distractors))
-        random.shuffle(distractors)
-        
-        # Check if we have enough options
-        if len(distractors) < self.cfg["min_pool_sizes"]["evidence_attribution"]:
-            return None
-        
-        # Determine multi-label
-        min_c, max_c = self.cfg["multilabel_caps"]["evidence_attribution"]
-        k_correct = min(max(len(correct_findings), 1), max_c)
-        correct = sorted(random.sample(correct_findings, k=k_correct)) if len(correct_findings) > k_correct else correct_findings
-        multi_label = len(correct) > 1
-        
-        # Build options
-        num_opts = self.cfg["num_options"]["evidence_attribution_multi"] if multi_label else self.cfg["num_options"]["evidence_attribution_single"]
-        needed = max(0, num_opts - len(correct))
-        options = correct + distractors[:needed]
-        random.shuffle(options)
-        
-        # Build question - adapt based on category
-        if impression.category == "Impression":
+            # Build distractor pool from category
+            pool = set()
+            for f in findings:
+                pool.update(self._pool.get_concept_pool(f.category, f.subcategory, use_category_scope=True))
+            
+            distractors = sorted(set(pool) - set(correct_findings))
+            random.shuffle(distractors)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["evidence_attribution"]:
+                return None
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["evidence_attribution"]
+            k_correct = min(max(len(correct_findings), 1), max_c)
+            correct = sorted(random.sample(correct_findings, k=k_correct)) if len(correct_findings) > k_correct else correct_findings
+            multi_label = len(correct) > 1
+            
+            num_opts = self.cfg["num_options"]["evidence_attribution_multi"] if multi_label else self.cfg["num_options"]["evidence_attribution_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
             question_templates = [
                 f"Which findings suggest {impression.concept}?",
                 f"Which findings support the diagnosis of {impression.concept}?",
                 f"Which ECG findings justify {impression.concept}?",
             ]
-        else:
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "evidence_attribution_multi" if multi_label else "evidence_attribution_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "correct_finding_ids": [f.entity_id for f in findings if f.concept in correct],
+                    "scope_level": "category",
+                    "scope_type": "a",
+                },
+            }
+        
+        # Scope b: subcategory-level findings
+        elif scope_type == "b":
+            correct_findings = sorted({f.concept for f in findings})
+            
+            # Build distractor pool from subcategory
+            pool = set()
+            for f in findings:
+                pool.update(self._pool.get_concept_pool(f.category, f.subcategory, use_category_scope=False))
+            
+            distractors = sorted(set(pool) - set(correct_findings))
+            random.shuffle(distractors)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["evidence_attribution"]:
+                return None
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["evidence_attribution"]
+            k_correct = min(max(len(correct_findings), 1), max_c)
+            correct = sorted(random.sample(correct_findings, k=k_correct)) if len(correct_findings) > k_correct else correct_findings
+            multi_label = len(correct) > 1
+            
+            num_opts = self.cfg["num_options"]["evidence_attribution_multi"] if multi_label else self.cfg["num_options"]["evidence_attribution_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
             question_templates = [
                 f"Which findings suggest {impression.concept}?",
+                f"Which findings support the diagnosis of {impression.concept}?",
                 f"Which ECG findings justify {impression.concept}?",
-                f"Which findings are associated with {impression.concept}?",
             ]
-        question = random.choice(question_templates)
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "evidence_attribution_multi" if multi_label else "evidence_attribution_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "correct_finding_ids": [f.entity_id for f in findings if f.concept in correct],
+                    "scope_level": "subcategory",
+                    "scope_type": "b",
+                },
+            }
         
-        return {
-            "qa_id": str(uuid.uuid4()),
-            "report_id": report.get("report_id"),
-            "family": "DiagnoseValidate",
-            "question_type": "evidence_attribution_multi" if multi_label else "evidence_attribution_single",
-            "difficulty": "D1",
-            "question": question,
-            "options": options,
-            "answer": correct if multi_label else correct[0],
-            "meta": {
-                "impression_id": impression.entity_id,
-                "impression_category": impression.category,
-                "impression_subcategory": impression.subcategory,
-                "impression_concept": impression.concept,
-                "correct_finding_ids": [f.entity_id for f in findings if f.concept in correct],
-                "scope_level": "relationship (evidence_attribution)",
-            },
-        }
+        # Scope c: category/subcategory with attributes
+        elif scope_type == "c":
+            use_cat_scope = any(self._should_use_category_scope(f.concept, f.subcategory) for f in findings)
+            
+            # Build correct answers with attributes
+            correct = []
+            attr_fields = self.cfg["attribute_fields"]["perceptual"]
+            for f in findings:
+                variations = self._format_entity_with_attributes(f.concept, f.attributes, attr_fields)
+                correct.extend(variations)
+            
+            correct = sorted(set(correct))
+            
+            # Build distractors
+            pool_concepts = set()
+            for f in findings:
+                pool_concepts.update(self._pool.get_concept_pool(f.category, f.subcategory, use_category_scope=use_cat_scope))
+            
+            distractors = []
+            correct_concepts = {f.concept for f in findings}
+            
+            for concept in pool_concepts:
+                if concept in correct_concepts:
+                    continue
+                
+                distractors.append(concept)
+                
+                # Add concept with attributes specific to this concept
+                for attr in attr_fields:
+                    concept_attr_values = self._pool.get_concept_attribute_pool(concept, attr)
+                    for val in list(concept_attr_values)[:3]:
+                        pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                        formatted = f"{concept} with {pretty_attr} of {val}"
+                        distractors.append(formatted)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["evidence_attribution"]:
+                return None
+            
+            random.shuffle(distractors)
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["evidence_attribution"]
+            k_correct = min(max(len(correct), 1), max_c)
+            correct = sorted(random.sample(correct, k=k_correct)) if len(correct) > k_correct else correct
+            multi_label = len(correct) > 1
+            
+            num_opts = self.cfg["num_options"]["evidence_attribution_multi"] if multi_label else self.cfg["num_options"]["evidence_attribution_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
+            question_templates = [
+                f"Which findings suggest {impression.concept}?",
+                f"Which findings support the diagnosis of {impression.concept}?",
+                f"Which ECG findings justify {impression.concept}?",
+            ]
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "evidence_attribution_multi" if multi_label else "evidence_attribution_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "correct_finding_ids": [f.entity_id for f in findings],
+                    "scope_level": "category_with_attributes" if use_cat_scope else "subcategory_with_attributes",
+                    "scope_type": "c",
+                    "attribute_role": "perceptual",
+                },
+            }
+        
+        # Scope d: concept with attributes
+        elif scope_type == "d":
+            # Group findings by concept
+            by_concept = collections.defaultdict(list)
+            for f in findings:
+                by_concept[f.concept].append(f)
+            
+            # Pick one concept
+            concept = random.choice(list(by_concept.keys()))
+            ents_for_concept = by_concept[concept]
+            
+            # Build correct answers
+            correct = []
+            attr_fields = self.cfg["attribute_fields"]["perceptual"]
+            for ent in ents_for_concept:
+                variations = self._format_entity_with_attributes(ent.concept, ent.attributes, attr_fields)
+                correct.extend(variations)
+            
+            correct = sorted(set(correct))
+            
+            # Build distractors: same concept with different attributes
+            distractors = []
+            
+            for attr in attr_fields:
+                concept_attr_values = self._pool.get_concept_attribute_pool(concept, attr)
+                
+                existing_vals = set()
+                for ent in ents_for_concept:
+                    val = ent.attributes.get(attr)
+                    if val:
+                        if isinstance(val, (list, tuple, set)):
+                            existing_vals.update(val)
+                        else:
+                            existing_vals.add(val)
+                
+                # Add distractors with different attribute values specific to this concept
+                for val in concept_attr_values:
+                    if val in existing_vals:
+                        continue
+                    pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                    formatted = f"{concept} with {pretty_attr} of {val}"
+                    distractors.append(formatted)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["evidence_attribution"]:
+                return None
+            
+            random.shuffle(distractors)
+            
+            min_c, max_c = self.cfg["multilabel_caps"]["evidence_attribution"]
+            k_correct = min(max(len(correct), 1), max_c)
+            correct = sorted(random.sample(correct, k=k_correct)) if len(correct) > k_correct else correct
+            multi_label = len(correct) > 1
+            
+            num_opts = self.cfg["num_options"]["evidence_attribution_multi"] if multi_label else self.cfg["num_options"]["evidence_attribution_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
+            question_templates = [
+                f"Which attributes of {concept} suggest {impression.concept}?",
+                f"Which attributes of {concept} support the diagnosis of {impression.concept}?",
+                f"Which attributes of {concept} justify {impression.concept}?",
+            ]
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "evidence_attribution_multi" if multi_label else "evidence_attribution_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct if multi_label else correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "correct_finding_ids": [f.entity_id for f in ents_for_concept],
+                    "scope_level": "concept_with_attributes",
+                    "scope_type": "d",
+                    "target_concept": concept,
+                    "attribute_role": "perceptual",
+                },
+            }
+        
+        return None
 
     def _make_inference_item(self, report: Dict[str, Any], impression: EntityItem,
-                                    findings: List[EntityItem], all_entities: List[EntityItem]) -> Optional[Dict[str, Any]]:
+                                findings: List[EntityItem], all_entities: List[EntityItem],
+                                scope_type: str) -> Optional[Dict[str, Any]]:
         """
         Create a question asking which diagnosis is implied by given findings.
-        Template: "Which diagnosis is implied by {findings_set}?"
-        Distractors: other impressions, or same impression with different attributes
+        scope_type: a, b, c, or d
         """
         if not findings:
-            return None
-        
-        # Only create inference questions for Impression category
-        if impression.category != "Impression":
             return None
         
         # Select findings to show (limit to 2-3 for readability)
         k_findings = min(len(findings), 3)
         selected_findings = random.sample(findings, k=k_findings)
-        findings_text = ", ".join([f.concept for f in selected_findings])
         
-        # Correct answer
-        correct_concept = impression.concept
+        # Scope a: category-level diagnosis
+        if scope_type == "a":
+            findings_text = ", ".join([f.concept for f in selected_findings])
+            correct_concept = impression.concept
+            
+            # Build distractors from category
+            pool_impressions = self._pool.get_concept_pool("Impression", impression.subcategory, use_category_scope=True)
+            distractors = sorted([c for c in pool_impressions if c != correct_concept])
+            
+            # Add other impressions from report
+            other_impressions = [e.concept for e in all_entities
+                                if e.category == "Impression" and e.concept != correct_concept]
+            distractors.extend(other_impressions)
+            
+            distractors = sorted(set(distractors))
+            random.shuffle(distractors)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["inference"]:
+                return None
+            
+            correct = [correct_concept]
+            num_opts = self.cfg["num_options"]["inference_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
+            question_templates = [
+                f"Which diagnosis is implied by {findings_text}?",
+                f"What diagnosis do {findings_text} suggest?",
+                f"Based on {findings_text}, what is the most likely diagnosis?",
+            ]
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "inference_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "finding_ids": [f.entity_id for f in selected_findings],
+                    "findings_used": [f.concept for f in selected_findings],
+                    "scope_level": "category",
+                    "scope_type": "a",
+                },
+            }
         
-        # Build distractor pool: other impressions
-        distractors = []
+        # Scope b: subcategory-level diagnosis
+        elif scope_type == "b":
+            findings_text = ", ".join([f.concept for f in selected_findings])
+            correct_concept = impression.concept
+            
+            # Build distractors from subcategory
+            pool_impressions = self._pool.get_concept_pool("Impression", impression.subcategory, use_category_scope=False)
+            distractors = sorted([c for c in pool_impressions if c != correct_concept])
+            
+            # Add same subcategory impressions from report
+            same_subcat = [e.concept for e in all_entities
+                        if e.category == "Impression" and e.subcategory == impression.subcategory
+                        and e.concept != correct_concept]
+            distractors.extend(same_subcat)
+            
+            distractors = sorted(set(distractors))
+            random.shuffle(distractors)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["inference"]:
+                return None
+            
+            correct = [correct_concept]
+            num_opts = self.cfg["num_options"]["inference_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
+            question_templates = [
+                f"Which diagnosis is implied by {findings_text}?",
+                f"What diagnosis do {findings_text} suggest?",
+                f"Based on {findings_text}, what is the most likely diagnosis?",
+            ]
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "inference_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "finding_ids": [f.entity_id for f in selected_findings],
+                    "findings_used": [f.concept for f in selected_findings],
+                    "scope_level": "subcategory",
+                    "scope_type": "b",
+                },
+            }
         
-        # Strategy 1: Same subcategory (e.g., other myocardial injuries)
-        same_subcat = [e.concept for e in all_entities
-                      if e.category == "Impression" and e.subcategory == impression.subcategory
-                      and e.concept != correct_concept]
-        distractors.extend(same_subcat)
+        # Scope c: diagnosis with finding attributes
+        elif scope_type == "c":
+            # Build findings text with attributes
+            attr_fields = self.cfg["attribute_fields"]["perceptual"]
+            findings_with_attrs = []
+            
+            for f in selected_findings:
+                # Pick one attribute to show
+                attrs_available = [a for a in attr_fields if a in f.attributes and f.attributes[a]]
+                if attrs_available:
+                    attr = random.choice(attrs_available)
+                    val = f.attributes[attr]
+                    if isinstance(val, (list, tuple, set)):
+                        val = random.choice(list(val))
+                    pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                    findings_with_attrs.append(f"{f.concept} with {pretty_attr} of {val}")
+                else:
+                    findings_with_attrs.append(f.concept)
+            
+            findings_text = ", ".join(findings_with_attrs)
+            correct_concept = impression.concept
+            
+            # Build distractors
+            use_cat_scope = self._should_use_category_scope(impression.concept, impression.subcategory)
+            pool_impressions = self._pool.get_concept_pool("Impression", impression.subcategory, use_category_scope=use_cat_scope)
+            distractors = sorted([c for c in pool_impressions if c != correct_concept])
+            
+            distractors = sorted(set(distractors))
+            random.shuffle(distractors)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["inference"]:
+                return None
+            
+            correct = [correct_concept]
+            num_opts = self.cfg["num_options"]["inference_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
+            question_templates = [
+                f"Which diagnosis is implied by {findings_text}?",
+                f"What diagnosis do {findings_text} suggest?",
+                f"Based on {findings_text}, what is the most likely diagnosis?",
+            ]
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "inference_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "finding_ids": [f.entity_id for f in selected_findings],
+                    "findings_used": findings_with_attrs,
+                    "scope_level": "category_with_attributes" if use_cat_scope else "subcategory_with_attributes",
+                    "scope_type": "c",
+                    "attribute_role": "perceptual",
+                },
+            }
         
-        # Strategy 2: Other impressions from different subcategories
-        other_impressions = [e.concept for e in all_entities
-                            if e.category == "Impression" and e.concept != correct_concept]
-        distractors.extend(other_impressions)
+        # Scope d: concept-level diagnosis with specific attributes
+        elif scope_type == "d":
+            # Focus on one finding concept with its attributes
+            primary_finding = random.choice(selected_findings)
+            
+            # Build text with specific attributes
+            attr_fields = self.cfg["attribute_fields"]["perceptual"]
+            attrs_text = []
+            
+            for attr in attr_fields:
+                if attr in primary_finding.attributes and primary_finding.attributes[attr]:
+                    val = primary_finding.attributes[attr]
+                    if isinstance(val, (list, tuple, set)):
+                        val = random.choice(list(val))
+                    pretty_attr = self.cfg["attr_pretty"].get(attr, attr)
+                    attrs_text.append(f"{pretty_attr} of {val}")
+            
+            if attrs_text:
+                findings_text = f"{primary_finding.concept} with {', '.join(attrs_text[:2])}"  # Limit to 2 attributes
+            else:
+                findings_text = primary_finding.concept
+            
+            correct_concept = impression.concept
+            
+            # Build distractors
+            pool_impressions = self._pool.get_concept_pool("Impression", impression.subcategory, use_category_scope=True)
+            distractors = sorted([c for c in pool_impressions if c != correct_concept])
+            
+            distractors = sorted(set(distractors))
+            random.shuffle(distractors)
+            
+            if len(distractors) < self.cfg["min_pool_sizes"]["inference"]:
+                return None
+            
+            correct = [correct_concept]
+            num_opts = self.cfg["num_options"]["inference_single"]
+            needed = max(0, num_opts - len(correct))
+            options = correct + distractors[:needed]
+            random.shuffle(options)
+            
+            question_templates = [
+                f"Which diagnosis is implied by {findings_text}?",
+                f"What diagnosis does {findings_text} suggest?",
+                f"Based on {findings_text}, what is the most likely diagnosis?",
+            ]
+            question = random.choice(question_templates)
+            
+            return {
+                "qa_id": str(uuid.uuid4()),
+                "report_id": report.get("report_id"),
+                "family": "DiagnoseValidate",
+                "question_type": "inference_single",
+                "difficulty": "D1",
+                "question": question,
+                "options": options,
+                "answer": correct[0],
+                "meta": {
+                    "impression_id": impression.entity_id,
+                    "impression_concept": impression.concept,
+                    "finding_ids": [primary_finding.entity_id],
+                    "findings_used": [findings_text],
+                    "scope_level": "concept_with_attributes",
+                    "scope_type": "d",
+                    "target_concept": primary_finding.concept,
+                    "attribute_role": "perceptual",
+                },
+            }
         
-        # Strategy 3: Get impressions from pool if not enough in report
-        pool_impressions = self._pool.get_concept_pool("Impression", impression.subcategory, use_category_scope=True)
-        distractors.extend([c for c in pool_impressions if c != correct_concept])
-        
-        # Deduplicate and shuffle
-        distractors = sorted(set(distractors))
-        random.shuffle(distractors)
-        
-        # Check if we have enough options
-        if len(distractors) < self.cfg["min_pool_sizes"]["inference"]:
-            return None
-        
-        # Build options (single answer for inference)
-        correct = [correct_concept]
-        multi_label = False
-        
-        num_opts = self.cfg["num_options"]["inference_single"]
-        needed = max(0, num_opts - len(correct))
-        options = correct + distractors[:needed]
-        random.shuffle(options)
-        
-        # Build question
-        question_templates = [
-            f"Which diagnosis is implied by {findings_text}?",
-            f"What diagnosis do these findings suggest: {findings_text}?",
-            f"Based on {findings_text}, what is the most likely diagnosis?",
-        ]
-        question = random.choice(question_templates)
-        
-        return {
-            "qa_id": str(uuid.uuid4()),
-            "report_id": report.get("report_id"),
-            "family": "DiagnoseValidate",
-            "question_type": "inference_single",
-            "difficulty": "D2",
-            "question": question,
-            "options": options,
-            "answer": correct[0],
-            "meta": {
-                "impression_id": impression.entity_id,
-                "impression_category": impression.category,
-                "impression_subcategory": impression.subcategory,
-                "impression_concept": impression.concept,
-                "finding_ids": [f.entity_id for f in selected_findings],
-                "findings_used": [f.concept for f in selected_findings],
-                "scope_level": "relationship (inference)",
-            },
-        }
+        return None
 
     @staticmethod
     def _norm_val(v: Any) -> str:

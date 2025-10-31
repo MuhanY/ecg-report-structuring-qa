@@ -236,6 +236,11 @@ logs/
 # Viewer html
 *.html
 
+# Schema handling scripts
+merger.py
+migration.py
+migration_ecg_json.py
+
 # Large/generated intermediate outputs
 outputs/
 100_reports_v2schema/
