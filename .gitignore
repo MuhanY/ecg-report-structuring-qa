@@ -205,3 +205,41 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+######## (ECG report structuring + QA pipeline v5)
+
+# Jupyter autosave
+.ipynb_checkpoints/
+
+# Local IDE/editor configs
+.vscode/
+.idea/
+
+# Training / experiment artifacts
+checkpoints/
+runs/
+wandb/
+mlruns/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.h5
+*.model
+*.log
+logs/
+
+# Schema, reports, and QAs
+*.json
+*.jsonl
+
+# Viewer html
+*.html
+
+# Large/generated intermediate outputs
+outputs/
+100_reports_v2schema/
+legacy/
+tmp/
+cache/
+
